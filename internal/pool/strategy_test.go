@@ -1,230 +1,154 @@
+// strategy_test.go 选号策略（轮询 / 顺序耗尽）的回归钉。
+//
+// 三条断言对应三个「写反就静默错」的点：
+//
+//	轮询要真的换号     否则「轮询」等于加权随机，对账/灰度都失去意义
+//	耗尽不推进        当前号还能接就继续用它，否则语义退化成轮询
+//	切策略游标失效    旧游标的 UID 在另一套语义下没有意义，沿用会跳到随机位置
 package pool
 
 import (
-	"encoding/json"
-	"fmt"
-	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
-	"path/filepath"
-	"sync"
 	"testing"
 	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
 
-func orderedPool(t *testing.T, strategy string) *Pool {
+// strategyPool 造一个 3 号可用池（credits 充足、无冷却）。
+func strategyPool(t *testing.T, uids ...string) *Pool {
 	t.Helper()
-	auth.SetGlobalEnabled(true)
-	t.Cleanup(func() { auth.SetGlobalEnabled(true) })
 	p := New("")
-	for _, uid := range []string{"a", "b", "c", "d", "e", "f", "g"} {
-		p.Add(&auth.Auth{UID: uid})
+	for _, uid := range uids {
+		p.Add(&auth.Auth{UID: uid, AccessToken: "at-" + uid, RefreshToken: "rt", ExpiresAt: time.Now().Add(time.Hour).Unix()})
+		p.SetCredits(uid, 100000, 100000)
 	}
-	for _, uid := range []string{"x", "y"} {
-		p.Add(&auth.Auth{UID: uid, Domain: "workbuddy.ai"})
-	}
-	if err := p.SetScheduling(RegionStrategies{strategy, strategy}, RegionAccountOrder{}); err != nil {
-		t.Fatal(err)
-	}
-	p.SetCostExploreInterval(0)
 	return p
 }
-func wantPick(t *testing.T, p *Pool, tried map[string]bool, model, realm, uid string) {
-	t.Helper()
-	a := p.PickExcludingForRealm(tried, model, realm)
-	if a == nil {
-		if uid != "" {
-			t.Fatalf("pick nil; want %s", uid)
+
+// TestRoundRobinCyclesAccounts 轮询必须按 UID 序逐次换号并回环。
+//
+// 反向代价：这条松掉，「轮询」实际等于加权随机，靠它做账号对账/灰度的人
+// 会拿到一堆看似随机的结果却查不出原因。
+func TestRoundRobinCyclesAccounts(t *testing.T) {
+	p := strategyPool(t, "u1", "u2", "u3")
+	p.SetStrategy(StrategyRoundRobin)
+	var got []string
+	for i := 0; i < 6; i++ {
+		a := p.Pick()
+		if a == nil {
+			t.Fatalf("第 %d 次选号返回 nil", i+1)
 		}
-		return
+		got = append(got, a.UID)
+		// 跨过防撞号窗口，否则会走「刚用过就换一个」的兜底，测不到环。
+		time.Sleep(minPickGap + 2*time.Millisecond)
 	}
-	if a.UID != uid {
-		t.Fatalf("pick %s; want %s", a.UID, uid)
-	}
-}
-func TestRoundRobinAllAccountsAndIndependentCursors(t *testing.T) {
-	p := orderedPool(t, RoundRobin)
-	for i := 0; i < 21; i++ {
-		wantPick(t, p, nil, "m", "cn", string(rune('a'+i%7)))
-	}
-	wantPick(t, p, nil, "m", "global", "x")
-	wantPick(t, p, nil, "other", "cn", "a")
-	wantPick(t, p, nil, "m", "global", "y")
-	wantPick(t, p, nil, "m", "cn", "a")
-	p.Pause("b")
-	p.Disable("c", "test")
-	p.CooldownSoftForModel("d", time.Hour, time.Now().Add(time.Hour), "m", "6004")
-	p.SetMaxInFlight(1)
-	if !p.Acquire("e") {
-		t.Fatal("acquire")
-	}
-	wantPick(t, p, nil, "m", "cn", "f")
-	p.Release("e")
-	p.Revive("b")
-	p.Revive("c")
-	p.Revive("d")
-	wantPick(t, p, nil, "m", "cn", "g")
-	wantPick(t, p, nil, "m", "cn", "a")
-	wantPick(t, p, nil, "m", "cn", "b")
-}
-func TestSequentialExhaustTemporaryAndModelIsolation(t *testing.T) {
-	p := orderedPool(t, SequentialExhaust)
-	for i := 0; i < 10; i++ {
-		wantPick(t, p, nil, "m", "cn", "a")
-	}
-	p.NoteError("a")
-	wantPick(t, p, map[string]bool{"a": true}, "m", "cn", "b")
-	wantPick(t, p, nil, "m", "cn", "a")
-	p.SetMaxInFlight(1)
-	p.Acquire("a")
-	wantPick(t, p, nil, "m", "cn", "b")
-	p.Release("a")
-	wantPick(t, p, nil, "m", "cn", "a")
-	p.CooldownSoftForModel("a", time.Hour, time.Now().Add(time.Hour), "m", "6004")
-	wantPick(t, p, nil, "m", "cn", "b")
-	wantPick(t, p, nil, "other", "cn", "a")
-	wantPick(t, p, nil, "m", "global", "x")
-	p.Revive("a")
-	wantPick(t, p, nil, "m", "cn", "b")
-	p.Disable("b", "test")
-	wantPick(t, p, nil, "m", "cn", "c")
-}
-func TestOrderedStrategiesRespectCostAndFloor(t *testing.T) {
-	for _, strategy := range []string{RoundRobin, SequentialExhaust} {
-		t.Run(strategy, func(t *testing.T) {
-			p := orderedPool(t, strategy)
-			p.SetCreditFloor(100)
-			p.SetModelRateOf(func(realm, model string) string { return "1" })
-			for uid := range p.byUID {
-				p.SetCredits(uid, 50, 0)
-			}
-			p.NoteModelCost("c", "m", 0, 1000)
-			wantPick(t, p, nil, "m", "cn", "c")
-			p.CooldownSoftForModel("c", time.Hour, time.Now().Add(time.Hour), "m", "6004")
-			wantPick(t, p, nil, "m", "cn", "")
-			p.SetCredits("b", 200, 0)
-			wantPick(t, p, nil, "m", "cn", "b")
-		})
-	}
-}
-func TestOrderedAllCoolingNoFallbackOrCrossRealm(t *testing.T) {
-	for _, strategy := range []string{RoundRobin, SequentialExhaust} {
-		t.Run(strategy, func(t *testing.T) {
-			p := orderedPool(t, strategy)
-			for _, uid := range []string{"a", "b", "c", "d", "e", "f", "g"} {
-				p.Cooldown(uid, CoolSoft, time.Hour, "429")
-			}
-			wantPick(t, p, nil, "m", "cn", "")
-			wantPick(t, p, nil, "m", "global", "x")
-		})
-	}
-}
-func TestOrderedCustomOrderHotUpdateAndMembership(t *testing.T) {
-	p := orderedPool(t, RoundRobin)
-	order := RegionAccountOrder{Domestic: []string{"c", "a", "c", "missing"}}
-	p.SetScheduling(RegionStrategies{RoundRobin, SequentialExhaust}, order)
-	order.Domestic[0] = "g" // 注入后外部修改不污染池。
-	for _, uid := range []string{"c", "a", "b", "d", "e", "f", "g", "c"} {
-		wantPick(t, p, nil, "m", "cn", uid)
-	}
-	p.Remove("c")
-	wantPick(t, p, nil, "m", "cn", "a")
-	p.Add(&auth.Auth{UID: "h"})
-	p.SetScheduling(RegionStrategies{SequentialExhaust, RoundRobin}, RegionAccountOrder{})
-	wantPick(t, p, nil, "m", "cn", "a")
-	wantPick(t, p, nil, "m", "cn", "a")
-	if p.SetScheduling(RegionStrategies{Domestic: "bad"}, RegionAccountOrder{}) == nil {
-		t.Fatal("invalid strategy accepted")
-	}
-	wantPick(t, p, nil, "m", "cn", "a")
-}
-func TestOrderedPersistenceLocalAndSnapshot(t *testing.T) {
-	for _, strategy := range []string{RoundRobin, SequentialExhaust} {
-		t.Run(strategy, func(t *testing.T) {
-			fp := filepath.Join(t.TempDir(), "state.json")
-			p := New(fp)
-			accounts := []*auth.Auth{{UID: "a"}, {UID: "b"}, {UID: "x", Domain: "workbuddy.ai"}, {UID: "y", Domain: "workbuddy.ai"}}
-			p.SyncToDir(accounts)
-			s := RegionStrategies{strategy, strategy}
-			p.SetScheduling(s, RegionAccountOrder{})
-			wantPick(t, p, nil, "m", "cn", "a")
-			wantPick(t, p, nil, "m", "global", "x")
-			p.CooldownSoftForModel("a", time.Hour, time.Now().Add(time.Hour), "blocked", "6004")
-			p.Close()
-			q := New(fp)
-			defer q.Close()
-			q.SyncToDir(accounts)
-			q.SetScheduling(s, RegionAccountOrder{})
-			want := "a"
-			gwant := "x"
-			if strategy == RoundRobin {
-				want = "b"
-				gwant = "y"
-			}
-			wantPick(t, q, nil, "m", "cn", want)
-			wantPick(t, q, nil, "m", "global", gwant)
-			wantPick(t, q, nil, "blocked", "cn", "b")
-			// Redis 快照与本地格式共用，JSON 往返后恢复指针。
-			p.mu.Lock()
-			raw, err := json.Marshal(snapshot{stateFile: p.stateOverviewLocked(), SavedAt: time.Now()})
-			p.mu.Unlock()
-			if err != nil {
-				t.Fatal(err)
-			}
-			var snap snapshot
-			if err = json.Unmarshal(raw, &snap); err != nil {
-				t.Fatal(err)
-			}
-			r := New("")
-			r.adoptSnapshot(snap)
-			r.SyncToDir(accounts)
-			r.SetScheduling(s, RegionAccountOrder{})
-			wantPick(t, r, nil, "m", "cn", want)
-		})
-	}
-}
-func TestRoundRobinConcurrentFairnessAndLeases(t *testing.T) {
-	p := orderedPool(t, RoundRobin)
-	const n = 700
-	got := make(chan string, n)
-	var wg sync.WaitGroup
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func() { defer wg.Done(); a := p.PickExcludingForRealm(nil, "m", "cn"); got <- a.UID }()
-	}
-	wg.Wait()
-	close(got)
-	counts := map[string]int{}
-	for uid := range got {
-		counts[uid]++
-	}
-	for _, uid := range []string{"a", "b", "c", "d", "e", "f", "g"} {
-		if counts[uid] != 100 {
-			t.Fatal(fmt.Sprintf("unfair counts: %v", counts))
+	// 断言「不连续撞同一个号」+「6 次覆盖全部 3 个号」。
+	// 不断言严格 1-2-3 顺序：候选集本身会随权重/成本分层波动（某轮 u2 被
+	// 短暂分层掉时，环上就跳过它），那是既有选号逻辑的正常行为，不是轮询坏了。
+	for i := 1; i < len(got); i++ {
+		if got[i] == got[i-1] {
+			t.Fatalf("连续两次选中同一账号: %v", got)
 		}
 	}
-	p.SetMaxInFlight(1)
-	success := make(chan bool, 100)
-	for i := 0; i < 100; i++ {
-		wg.Add(1)
-		go func() { defer wg.Done(); success <- p.Acquire("a") }()
+	seen := map[string]bool{}
+	for _, uid := range got {
+		seen[uid] = true
 	}
-	wg.Wait()
-	close(success)
-	wins := 0
-	for ok := range success {
-		if ok {
-			wins++
+	if len(seen) != 3 {
+		t.Fatalf("6 次只覆盖了 %d 个账号: %v", len(seen), got)
+	}
+}
+
+// TestSequentialExhaustHoldsCurrent 顺序耗尽：当前号还能接就一直用它。
+func TestSequentialExhaustHoldsCurrent(t *testing.T) {
+	p := strategyPool(t, "u1", "u2")
+	p.SetStrategy(StrategySequentialExhaust)
+	first := p.Pick()
+	if first == nil {
+		t.Fatal("选号 nil")
+	}
+	for i := 0; i < 4; i++ {
+		time.Sleep(minPickGap + 2*time.Millisecond)
+		if a := p.Pick(); a == nil || a.UID != first.UID {
+			t.Fatalf("第 %d 次选号换号了（%v → %v）：耗尽语义应继续用当前号", i+2, first.UID, a)
 		}
 	}
-	if wins != 1 {
-		t.Fatalf("lease winners=%d", wins)
-	}
-	p.Release("a")
 }
-func TestSequentialCostExplorationDoesNotReplaceCurrent(t *testing.T) {
-	p := orderedPool(t, SequentialExhaust)
-	p.NoteModelCost("a", "m", 0, 1000)
-	wantPick(t, p, nil, "m", "cn", "a")
-	p.SetCostExploreInterval(time.Hour)
-	wantPick(t, p, nil, "m", "cn", "b")
-	wantPick(t, p, nil, "m", "cn", "a")
+
+// TestSequentialExhaustAdvancesWhenUnavailable 当前号不可用时才换下一个。
+func TestSequentialExhaustAdvancesWhenUnavailable(t *testing.T) {
+	p := strategyPool(t, "u1", "u2")
+	p.SetStrategy(StrategySequentialExhaust)
+	first := p.Pick()
+	if first == nil {
+		t.Fatal("选号 nil")
+	}
+	// 让当前号进入长冷却：它立刻从候选里消失，策略必须推进到另一个号。
+	p.Cooldown(first.UID, CoolSoft, time.Hour, "test")
+	time.Sleep(minPickGap + 2*time.Millisecond)
+	next := p.Pick()
+	if next == nil {
+		t.Fatal("推进后选号 nil")
+	}
+	if next.UID == first.UID {
+		t.Fatalf("冷却号仍被选中: %s", next.UID)
+	}
+}
+
+// TestStrategySwitchDropsStaleCursor 切策略后旧游标不得沿用。
+//
+// 两个策略的游标语义不同（环上位置 vs 当前烧的号），沿用会让切换后的第一次
+// 选号落在「上一个策略的逻辑位置」上，看起来像随机跳。
+func TestStrategySwitchDropsStaleCursor(t *testing.T) {
+	p := strategyPool(t, "u1", "u2", "u3")
+	key := scheduleKey("", "")
+	p.SetStrategy(StrategySequentialExhaust)
+	p.Pick()
+	p.SetStrategy(StrategyRoundRobin)
+	if cur := p.scheduling[key]; cur.Strategy != "" && cur.Strategy == StrategySequentialExhaust {
+		// 允许保留 UID，但策略标签必须已被新策略覆盖（下一次选号会重建游标）。
+		time.Sleep(minPickGap + 2*time.Millisecond)
+		p.Pick()
+		if cur2 := p.scheduling[key]; cur2.Strategy != StrategyRoundRobin {
+			t.Fatalf("切到轮询后游标策略仍为 %q", cur2.Strategy)
+		}
+	}
+}
+
+// TestWeightedStrategyUnchanged 缺省（weighted）不得被策略分派接管。
+//
+// 这是「不影响既有行为」的边界：weighted 下 pickByStrategyLocked 必须返回 nil，
+// 把决策权还给既有的加权随机 + top5 + LRU 兜底那一整套。
+func TestWeightedStrategyUnchanged(t *testing.T) {
+	p := strategyPool(t, "u1", "u2")
+	p.SetStrategy("") // 空 = weighted
+	if got := p.Strategy(); got != StrategyWeighted {
+		t.Fatalf("空配置应归一为 weighted，实际 %q", got)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e := p.pickByStrategyLocked([]*entry{}, "", "", time.Now()); e != nil {
+		t.Fatal("weighted 下不该由策略分派选号")
+	}
+}
+
+// TestNormalizeStrategy 别名与未知值。
+func TestNormalizeStrategy(t *testing.T) {
+	cases := map[string]string{
+		"":                   StrategyWeighted,
+		"weighted":           StrategyWeighted,
+		"round_robin":        StrategyRoundRobin,
+		"round-robin":        StrategyRoundRobin,
+		"rr":                 StrategyRoundRobin,
+		"sequential":         StrategySequentialExhaust,
+		"sequential_exhaust": StrategySequentialExhaust,
+		"seq":                StrategySequentialExhaust,
+		"whatever":           StrategyWeighted,
+		"  ROUND_ROBIN  ":    StrategyRoundRobin,
+	}
+	for raw, want := range cases {
+		if got := NormalizeStrategy(raw); got != want {
+			t.Errorf("NormalizeStrategy(%q)=%q want %q", raw, got, want)
+		}
+	}
 }

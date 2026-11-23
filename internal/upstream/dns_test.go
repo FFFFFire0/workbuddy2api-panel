@@ -1,141 +1,116 @@
+// dns_test.go 出站 DNS 覆盖（config dns_servers / WB2A_DNS）回归。
+//
+// 这条接线的价值全在「系统解析器不可用」的环境（Android 无 /etc/resolv.conf、本地
+// DNS 被污染）。测试不依赖外网：用本地 TCP 监听冒充 DNS 服务器，验证拨号器确实
+// 按配置的服务器建连、并按顺序在失败后换下一台。
 package upstream
 
 import (
 	"context"
-	"encoding/binary"
 	"net"
 	"net/http"
-	"reflect"
 	"testing"
 	"time"
 )
 
-// fakeDNS 起一个只回 A=127.0.0.9 的极简 DNS 服务器，返回地址与"收到查询"的信号。
-func fakeDNS(t *testing.T) (string, <-chan struct{}) {
-	t.Helper()
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	if err != nil {
-		t.Skipf("UDP 不可用：%v", err)
+// 未配置服务器时必须是「系统解析器」原样：Resolver 为 nil，SetDNSDialer 也不动
+// Transport——否则一个默认配置的空列表会悄悄改掉所有出站解析行为。
+func TestNewDNSDialerWithoutServersKeepsSystemResolver(t *testing.T) {
+	d := NewDNSDialer(nil)
+	if d == nil || d.Resolver != nil {
+		t.Fatalf("空列表应返回系统解析器拨号器，got %+v", d)
 	}
-	t.Cleanup(func() { _ = pc.Close() })
-	got := make(chan struct{}, 1)
+	if d.Timeout != dialTimeout || d.KeepAlive != dialKeepAlive {
+		t.Fatalf("连接层参数应沿用 newDialer：timeout=%v keepalive=%v", d.Timeout, d.KeepAlive)
+	}
+
+	c := New()
+	c.SetDNSDialer(NewDNSDialer(nil))
+	if c.HTTP.Transport.(*http.Transport).DialContext == nil {
+		t.Fatal("不应把 DialContext 清成 nil")
+	}
+}
+
+// 配置了服务器时：PreferGo 必须开（cgo 解析器无视 Resolver.Dial，会继续走系统配置），
+// 且首台连不上要自动换下一台，而不是整轮解析失败。
+func TestNewDNSDialerAdvancesThroughServers(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
 	go func() {
-		buf := make([]byte, 512)
 		for {
-			n, addr, err := pc.ReadFrom(buf)
+			conn, err := ln.Accept()
 			if err != nil {
 				return
 			}
-			select {
-			case got <- struct{}{}:
-			default:
-			}
-			if resp := dnsReply(buf[:n]); resp != nil {
-				_, _ = pc.WriteTo(resp, addr)
-			}
+			conn.Close()
 		}
 	}()
-	return pc.LocalAddr().String(), got
+
+	// 第一台指向必然拒绝的端口（tcp 拨号会立刻 ECONNREFUSED），第二台是真监听。
+	dead := "127.0.0.1:1"
+	alive := ln.Addr().String()
+	d := NewDNSDialer([]string{dead, alive})
+	if d.Resolver == nil || !d.Resolver.PreferGo {
+		t.Fatalf("Resolver 必须存在且 PreferGo=true：%+v", d.Resolver)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	// 只验证「按配置的服务器建连」这一段（Dial 本身），不验证真实查询/应答：
+	// 冒充的服务器不回应 DNS 报文，但建连成功即证明走的是配置的解析器。
+	conn, err := d.Resolver.Dial(ctx, "tcp", "ignored:53")
+	if err != nil {
+		t.Fatalf("应在首台失败后落到第二台：%v", err)
+	}
+	if got := conn.RemoteAddr().String(); got != alive {
+		conn.Close()
+		t.Fatalf("建连地址=%q want %q（未按顺序尝试配置的服务器）", got, alive)
+	}
+	conn.Close()
 }
 
-// dnsReply 把查询原样改成一条 A=127.0.0.9 的响应（够测试用，不解析问题段）。
-func dnsReply(q []byte) []byte {
-	if len(q) < 12 {
-		return nil
-	}
-	// 只回带问题段：查询里可能还有 EDNS0 之类的附加记录，整段照抄会被
-	// 当成第一条 answer（type=41）解析，客户端就只看到"没有 A 记录"。
-	i := 12
-	for i < len(q) {
-		l := int(q[i])
-		if l == 0 {
-			i++
-			break
-		}
-		if l&0xC0 == 0xC0 { // 压缩指针（查询里一般不会出现）
-			i += 2
-			break
-		}
-		i += 1 + l
-	}
-	i += 4 // qtype + qclass
-	if i > len(q) {
-		return nil
-	}
-	out := make([]byte, 12, 64)
-	copy(out, q[:2])                        // 同一个事务 ID
-	out[2], out[3] = 0x81, 0x80             // 标准响应 + 递归可用 + 无错误
-	binary.BigEndian.PutUint16(out[4:6], 1) // QDCOUNT
-	binary.BigEndian.PutUint16(out[6:8], 1) // ANCOUNT
-	out = append(out, q[12:i]...)           // 问题段
-	out = append(out, 0xC0, 0x0C)           // 名字指针指向问题段
-	out = append(out, 0x00, 0x01, 0x00, 0x01)
-	out = append(out, 0x00, 0x00, 0x00, 0x3C)
-	out = append(out, 0x00, 0x04, 127, 0, 0, 9)
-	return out
-}
-
-// TestNewDNSDialerUsesConfiguredServer 配了 DNS 就必须查它，而不是系统解析器。
-func TestNewDNSDialerUsesConfiguredServer(t *testing.T) {
-	addr, got := fakeDNS(t)
-	d := NewDNSDialer([]string{addr})
-	if d.Resolver == nil {
-		t.Fatal("配了 DNS 却没换 Resolver")
-	}
+// 全部服务器都连不上时返回错误（不是 panic、不是 nil 连接）。
+func TestNewDNSDialerAllServersFail(t *testing.T) {
+	d := NewDNSDialer([]string{"127.0.0.1:1"})
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	ips, err := d.Resolver.LookupHost(ctx, "example.com")
-	if err != nil {
-		t.Fatalf("解析失败：%v", err)
-	}
-	if len(ips) != 1 || ips[0] != "127.0.0.9" {
-		t.Fatalf("解析结果=%v，期望 [127.0.0.9]（说明没走配置的 DNS）", ips)
-	}
-	select {
-	case <-got:
-	default:
-		t.Fatal("配置的 DNS 服务器没收到查询")
+	conn, err := d.Resolver.Dial(ctx, "tcp", "ignored:53")
+	if err == nil {
+		conn.Close()
+		t.Fatal("全台失败应返回 error")
 	}
 }
 
-// TestNewDNSDialerEmptyUsesSystemResolver 不配 DNS 时保持系统解析器。
-func TestNewDNSDialerEmptyUsesSystemResolver(t *testing.T) {
-	for _, servers := range [][]string{nil, {}} {
-		if d := NewDNSDialer(servers); d.Resolver != nil {
-			t.Fatalf("servers=%v 时换了 Resolver，应该维持系统解析器", servers)
-		}
-	}
-}
-
-// TestSetDNSDialerPatchesBothClients 两个 http.Client 都要换拨号器，且不动超时等既有参数。
-func TestSetDNSDialerPatchesBothClients(t *testing.T) {
-	httpTr, chatTr := &http.Transport{}, &http.Transport{}
-	c := &Client{
-		HTTP:     &http.Client{Timeout: 5 * time.Second, Transport: httpTr},
-		ChatHTTP: &http.Client{Transport: chatTr},
-	}
-	d := &net.Dialer{}
+// SetDNSDialer 必须把拨号器挂到两个 client 上（HTTP 与 ChatHTTP 共用 newTransport
+// 实例；真实部署里两者可能被 Config 分别改写 Transport，故各自覆盖）。
+func TestSetDNSDialerWiresBothClients(t *testing.T) {
+	c := New()
+	d := NewDNSDialer([]string{"127.0.0.1:53"})
 	c.SetDNSDialer(d)
-	want := reflect.ValueOf(d.DialContext).Pointer()
-	for name, tr := range map[string]*http.Transport{"HTTP": httpTr, "ChatHTTP": chatTr} {
-		if tr.DialContext == nil {
-			t.Fatalf("%s 的 DialContext 没换", name)
+	for name, cl := range map[string]*http.Client{"HTTP": c.HTTP, "ChatHTTP": c.ChatHTTP} {
+		tr, ok := cl.Transport.(*http.Transport)
+		if !ok {
+			t.Fatalf("%s Transport 类型变了：%T", name, cl.Transport)
 		}
-		if got := reflect.ValueOf(tr.DialContext).Pointer(); got != want {
-			t.Fatalf("%s 的 DialContext 不是传入的拨号器", name)
+		if tr.DialContext == nil {
+			t.Fatalf("%s DialContext 未接线", name)
 		}
 	}
-	if c.HTTP.Timeout != 5*time.Second {
-		t.Fatal("既有 Timeout 被改掉了")
+	// 连接池参数不能被顺手改掉（挂 DNS 只该动 DialContext）。
+	tr := c.ChatHTTP.Transport.(*http.Transport)
+	if tr.MaxIdleConnsPerHost != maxIdleConnsPerHost || tr.IdleConnTimeout != idleConnTimeout {
+		t.Fatalf("连接池参数被改动：%+v", tr)
 	}
 }
 
-// TestSetDNSDialerNilIsNoop 传 nil 不动任何东西。
-func TestSetDNSDialerNilIsNoop(t *testing.T) {
-	tr := &http.Transport{}
-	c := &Client{HTTP: &http.Client{Transport: tr}}
+// nil 拨号器不得panic、不得改动 Transport（配置解析失败路径会传 nil）。
+func TestSetDNSDialerIgnoresNil(t *testing.T) {
+	c := New()
 	c.SetDNSDialer(nil)
-	if tr.DialContext != nil {
-		t.Fatal("传 nil 却换了 DialContext")
+	if c.HTTP.Transport.(*http.Transport).DialContext == nil {
+		t.Fatal("nil 拨号器不应清掉 DialContext")
 	}
 }

@@ -109,6 +109,124 @@ func repackToolResultBlocks(messages []any) ([]any, bool) {
 	return out, true
 }
 
+// reorderEarlyToolResults 把「早于其 tool_call」出现的 role:tool 结果移到对应
+// assistant(tool_calls) 之后，保证 wire 上永远是「调用在前、结果在后」。
+//
+// 背景：OpenAI 兼容协议按位置配对——tool 结果必须出现在声明它的 assistant 之后。
+// 有些客户端会把这个顺序写反（Codex 经 cc-switch 类本地代理转发 /v1/responses 时，
+// input 里 function_call_output 排在 function_call 之前；本仓 responses 适配器的
+// convertInputItems 按原始顺序拼接，于是出站就是 tool(c0) 在前、assistant(tool_calls
+// c0) 在后），上游判 11148 tool_call_sequence_broken 顶死整条会话。
+//
+// 参照 hub PR #3（PolarisTime，niyouqianma/workbuddy2api-hub）的
+// reorder_early_tool_results：只调顺序、不改内容，工具语义与结果正文都原样保留。
+//
+// 目标位置是所属 assistant 之后、**其后连续 tool 结果之后**（与 PR 同口径），
+// 因此用「延迟到结果区结束再落地」而不是插在 assistant 紧跟的位置：正常顺序的
+// 结果先出，早到的那几条补在同批末尾，同批内的原相对顺序保持不变。
+//
+// 归属判定：**id 会跨轮复用**——上游没给 id 时网关自己按轮内下标补 call_0 / toolu_0
+// （responses.go / messages.go 的 openTool），同一会话里每轮都可能有一个 call_0。
+// 所以不能「同 id 跟最后一次声明走」（PR 的口径）：那会把顺序本来正确的第一轮结果
+// 搬到最后一轮之后，反而制造 11148。这里正序扫描，记每个 id「已声明、未应答」的次数：
+//   - 结果命中未应答的声明 → 正常配对，原地不动；
+//   - 否则它不属于前面任何一次声明：后面有同 id 的声明就是早到结果，归**最近**那一次，
+//     并预先记作该次已应答（之后同 id 的结果不会再被它吸走）；
+//   - 前后都找不到声明者的孤儿结果不动，交给 cleanupOrphanToolCalls 删；
+//   - 本来顺序就对的请求零改动零分配（返回原 slice）。
+func reorderEarlyToolResults(messages []any) ([]any, bool) {
+	if len(messages) < 2 {
+		return messages, false
+	}
+	// 每个 id 的全部声明下标（正序遍历 → 升序）。
+	decls := map[string][]int{}
+	for i, raw := range messages {
+		for _, id := range declaredToolCallIDs(raw) {
+			decls[id] = append(decls[id], i)
+		}
+	}
+	if len(decls) == 0 {
+		return messages, false
+	}
+	open := map[string]int{} // id → 已声明未应答次数；早到结果先扣，可暂为负
+	group := map[int][]any{} // 声明下标 → 归它的早到结果（原相对顺序）
+	early := make([]bool, len(messages))
+	anyEarly := false
+	for i, raw := range messages {
+		for _, id := range declaredToolCallIDs(raw) {
+			open[id]++
+		}
+		m, ok := raw.(map[string]any)
+		if !ok || m["role"] != "tool" {
+			continue
+		}
+		id, _ := m["tool_call_id"].(string)
+		if open[id] > 0 {
+			open[id]--
+			continue
+		}
+		for _, j := range decls[id] {
+			if j > i {
+				early[i] = true
+				anyEarly = true
+				group[j] = append(group[j], raw)
+				open[id]--
+				break
+			}
+		}
+	}
+	if !anyEarly {
+		return messages, false
+	}
+
+	out := make([]any, 0, len(messages))
+	var pending []any
+	flush := func() {
+		if len(pending) == 0 {
+			return
+		}
+		out = append(out, pending...)
+		pending = nil
+	}
+	for i, raw := range messages {
+		if early[i] {
+			continue // 早到的结果不在此处落地
+		}
+		role := ""
+		if m, ok := raw.(map[string]any); ok {
+			role, _ = m["role"].(string)
+		}
+		// 结果区结束（来了一条非 tool 消息）：先把上一批待补的结果补上。
+		if len(pending) > 0 && role != "tool" {
+			flush()
+		}
+		out = append(out, raw)
+		if g, ok := group[i]; ok {
+			pending = g
+		}
+	}
+	flush()
+	return out, true
+}
+
+// declaredToolCallIDs 返回一条 assistant 消息 tool_calls 里的非空 id（其他消息为 nil）。
+func declaredToolCallIDs(raw any) []string {
+	m, ok := raw.(map[string]any)
+	if !ok || m["role"] != "assistant" {
+		return nil
+	}
+	tcs, _ := m["tool_calls"].([]any)
+	var ids []string
+	for _, tci := range tcs {
+		if tc, ok := tci.(map[string]any); ok {
+			if id, _ := tc["id"].(string); id != "" {
+				ids = append(ids, id)
+			}
+		}
+	}
+	return ids
+}
+
 // cleanupOrphanToolCalls 剔除无法配对的 tool_call 与 tool 结果（所有模型，独立于
 // deepseek-only 的 sanitize 开关）。语义对齐参考仓库 resolveToolPairing：
 //
@@ -148,7 +266,7 @@ func cleanupOrphanToolCalls(messages []any) ([]any, bool) {
 					}
 					if id, ok := tc["id"].(string); ok && id != "" {
 						callIDs[id] = true
-						if toolCallNameEmpty(tc) {
+						if toolCallNameMissing(tc) {
 							nameBadIDs[id] = true
 						}
 						hasTraffic = true
@@ -162,10 +280,11 @@ func cleanupOrphanToolCalls(messages []any) ([]any, bool) {
 	}
 	// keepCalls：调用 id 是否双侧齐全（调用存在且结果存在）。重复 id 与乱序均按集合处理。
 	//
-	// 追加否决条件：function.name 为空（含纯空白）的调用一律不保留。上游对这类
-	// 条目直接判 11133 model_param_invalid（tool_calls[i].function.name must be a
-	// non-empty string），且带不带配对结果都会拒——带结果的脏条目原本会命中
-	// keepCalls 原样出站，正是线上 503 的成因。删除动作完全复用两侧对称裁剪。
+	// 追加否决条件：没有可用功能名（无 function 键 / 无 name 键 / name 空白）的调用一律
+	// 不保留。上游对这类条目直接判 11133 model_param_invalid（tool_calls[i].function.name
+	// must be a non-empty string），**带不带配对结果都拒**——带结果的脏条目原本会命中
+	// keepCalls 原样出站，正是线上「整条会话每轮 400、只能手动清空历史」的成因。删除动作
+	// 完全复用两侧对称裁剪（调用与其结果成对剔除），配对对称不变式照常成立。
 	keepCalls := map[string]bool{}
 	for id := range callIDs {
 		if nameBadIDs[id] {
@@ -239,37 +358,31 @@ func cleanupOrphanToolCalls(messages []any) ([]any, bool) {
 	return kept, true
 }
 
-// mergeAdjacentToolCalls 把**背靠背**的 assistant.tool_calls 消息合成一条（tool_calls 依原序拼接）。
+// toolCallNameMissing 报告 assistant.tool_calls[] 单项是否缺少可用的功能名：
+// function 对象缺失、name 字段缺失、name 为空白串，三者皆判真。
 //
-// 2026-09-20 实机定位并复现的 11148 事故根因：部分 OpenAI 兼容 agent 客户端回放历史时把
-// 同一批并行工具调用拆成多条紧邻的独立 assistant 消息，出站载荷长成：
-//
-//	assistant tool_calls=[c00]
-//	assistant tool_calls=[c01]
-//	tool c00
-//	tool c01
-//
-// 上游要求「声明 tool_calls 的 assistant 之后必须紧跟它自己的结果」——紧随的若是另一条带
-// tool_calls 的 assistant，即返回 400 code=11148（extError tool_call_sequence_broken，
-// "tool calls and tool results do not match, please start a new conversation and retry"），
-// 整条会话报废：客户端每次重试重放同一条历史，池侧换号也无效（不是账号问题）。
-//
-// 对照实验（2026-09-20 在线上网关实测，同一批调用）：
-//   - 拆成两条 assistant（Codex Desktop 报文形状）+ deepseek-v4.1-flash → 503 / 11148
-//   - 合成一条 assistant（=本函数产物）      + deepseek-v4.1-flash → 200
-//   - 拆成两条 assistant                     + glm-5.3-flash      → 200（该模型宽容）
-//
-// 即：**行为本身合法**（上述第一种形态在 OpenAI 规范里也说得通），是上游 deepseek 系模型的
-// 校验更严。网关作为最后一道防线按最严口径归一，客户端不必感知。
-//
-// 合并条件从严，避免引入新语义：
-//   - 两条消息**相邻**（中间隔着任何消息都不合并——隔着消息说明不是同一批声明，
-//     凭猜测合并会改变语义，这类形态按其原样交给 repackToolResultBlocks 处理）；
-//   - 后一条 content 为空（content 非空无法无损拼接，不猜语义）；
-//   - 前一条本身必须是带 tool_calls 的 assistant（否则不合并，例如 assistant 文本 + 独立工具调用消息）。
-//
-// reasoning_content（thinking.go 的多轮回填字段）不丢：后一条有则搬到合并结果，两边都有则换行拼接
-// （deepseek 多轮要求 assistant 带思维链回填，丢弃会换一个错误）。
+// 为什么比「function 在、name 键存在且为空」宽一格：本网关自己就能产出另两种形状——
+// 流在 name 分片到达前断掉时，聚合器落下的占位条目是 `{"id":..,"type":"function"}`
+// （无 function 键）或 `{"id":..,"function":{}}`（有 function 无 name 键），实测见
+// Aggregate。这类条目客户端无从派发、上游无从校验，留着只会把整条会话顶死。
+// OpenAI schema 本就要求 function.name 非空，故不存在「合法但缺名」的入站历史，
+// 判脏不会误伤正确配对——代价只是丢一轮工具上下文，正是本文件的既定取舍。
+func toolCallNameMissing(tc map[string]any) bool {
+	fn, ok := tc["function"].(map[string]any)
+	if !ok {
+		return true
+	}
+	name, ok := fn["name"].(string)
+	if !ok {
+		return true
+	}
+	return strings.TrimSpace(name) == ""
+}
+
+// mergeAdjacentToolCalls 把背靠背的 assistant(tool_calls) 消息合成一条
+// （部分 agent 客户端回放并行调用的报文形状），是上游 deepseek 系模型 11148
+// 的正面修复；先合并再 repack，repack 才看得到完整的一批调用。
+// 本函数由 linguo 线独有资产回迁（commit 0d0e509）。
 func mergeAdjacentToolCalls(messages []any) ([]any, bool) {
 	if len(messages) < 2 {
 		return messages, false
@@ -283,8 +396,7 @@ func mergeAdjacentToolCalls(messages []any) ([]any, bool) {
 			continue
 		}
 		if role, _ := msg["role"].(string); role == "assistant" && len(out) > 0 {
-			// 形态一：本条是带 tool_calls 的 assistant 且没有正文 → 并入上一条
-			// 同为 assistant 且带 tool_calls 的消息（背靠背的并行调用声明）。
+			// 形态一：本条是无正文的 tool_calls assistant → 并入上一条同为 assistant 且带 tool_calls 的消息
 			if tcs, ok := msg["tool_calls"].([]any); ok && len(tcs) > 0 && emptyContent(msg["content"]) {
 				if prev, ok := out[len(out)-1].(map[string]any); ok {
 					if prevRole, _ := prev["role"].(string); prevRole == "assistant" {
@@ -297,15 +409,9 @@ func mergeAdjacentToolCalls(messages []any) ([]any, bool) {
 					}
 				}
 			}
-			// 形态二（反向）：本条是纯正文 assistant，上一条是带 tool_calls 但没正文的
-			// assistant → 把正文折进上一条，合成 assistant(正文 + tool_calls)。这样
-			// "声明 tool_calls 的 assistant 紧跟它自己的结果"在两种拆分顺序下都成立。
-			//
-			// 谁会产出这个顺序：部分 OpenAI 兼容 agent 客户端的回放顺序（正文与
-			// 调用声明拆成两条独立 assistant）。
-			//
-			// 条件同样从严：只认**字符串正文**（数组正文可能含多模态块，拼接会丢结构，
-			// 交给 repackToolResultBlocks 原样处理）；上一条必须自身无正文。
+			// 形态二（反向）：本条是纯正文 assistant，上一条是无正文的 tool_calls assistant
+			// → 把正文折进上一条，合成 assistant(正文 + tool_calls)。
+			// 只对字符串正文操作（数组正文可能含多模态块，拼接会破坏结构，交给 repack 处理）。
 			if _, hasCalls := msg["tool_calls"]; !hasCalls {
 				if txt, ok := msg["content"].(string); ok && txt != "" {
 					if prev, ok := out[len(out)-1].(map[string]any); ok {
@@ -343,11 +449,8 @@ func mergeReasoningContent(dst, src map[string]any) {
 	dst["reasoning_content"] = rc
 }
 
-// emptyContent content 是否为空（缺失 / nil / 空串 / 空数组）。
-// 空数组也必须算空：有客户端把"没有正文"发成 `content: []` 而不是 null，此前按
-// "非字符串一律非空"处理 → 背靠背的两条 assistant(tool_calls) 不合并 → 上游
-// deepseek 系判 11148（正是 mergeAdjacentToolCalls 要挡的形态，条件漏了 []）。
-// 非空数组仍视为有内容：宁可漏合并，也不丢内容。
+// emptyContent content 是否为空（缺省 / nil / 空串 / 空数组）。
+// 空数组也必须算空：有客户端把「没有正文」发成 content: [] 而不是 null。
 func emptyContent(v any) bool {
 	switch c := v.(type) {
 	case nil:
@@ -358,20 +461,4 @@ func emptyContent(v any) bool {
 		return len(c) == 0
 	}
 	return false
-}
-
-// toolCallNameEmpty 判断 assistant.tool_calls[] 单项的 function.name 是否为空。
-// 仅当 function 对象存在、name 字段存在且为空白字符串时判真；
-// function / name 字段缺失时判假——历史报文里存在不带 function 的占位条目，
-// 上游不会因此拒参，这里不扩大打击面。
-func toolCallNameEmpty(tc map[string]any) bool {
-	fn, ok := tc["function"].(map[string]any)
-	if !ok {
-		return false
-	}
-	name, ok := fn["name"].(string)
-	if !ok {
-		return false
-	}
-	return strings.TrimSpace(name) == ""
 }

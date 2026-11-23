@@ -40,7 +40,10 @@ func TestCNChatBaseOverride(t *testing.T) {
 // cn.chat_base 只在装配期生效，面板保存后须提示重启。
 func TestCNChatBaseRequiresRestart(t *testing.T) {
 	cfg := Default()
-	if !slices.Contains(restartRequiredFields(cfg), "cn.chat_base") {
+	// 本 fork 的 restartRequiredFields 比较「运行值 vs 新值」，故造一个差异。
+	next := Default()
+	next.CN.ChatBase = "https://example.invalid"
+	if !slices.Contains(restartRequiredFields(cfg, next), "cn.chat_base") {
 		t.Fatal("cn.chat_base missing from restart-required fields")
 	}
 }
