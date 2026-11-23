@@ -7,11 +7,13 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/misakano7545/workbuddy2api-panel/internal/upstream"
 )
 
 func TestDefault(t *testing.T) {
 	c := Default()
-	if c.Listen != ":7863" {
+	if c.Listen != "127.0.0.1:7863" {
 		t.Errorf("listen=%s", c.Listen)
 	}
 	if err := c.normalize(); err != nil {
@@ -19,6 +21,134 @@ func TestDefault(t *testing.T) {
 	}
 	if c.SoftRateDur.Seconds() != 600 {
 		t.Errorf("soft=%v want 600s", c.SoftRateDur)
+	}
+	if c.Update.AutoEnabled {
+		t.Error("update.auto_enabled default should be false")
+	}
+	if c.Update.AutoTime != "04:00" {
+		t.Errorf("update.auto_time=%q want 04:00", c.Update.AutoTime)
+	}
+}
+
+func TestUpdateAutoTimeValidation(t *testing.T) {
+	for _, value := range []string{"4:00", "+0:00", "24:00", "12:60", "noon"} {
+		if _, err := ParseConfig([]byte(`{"update":{"auto_time":"` + value + `"}}`)); err == nil {
+			t.Fatalf("auto_time %q should be rejected", value)
+		}
+	}
+	for _, value := range []string{"00:00", "04:00", "23:59"} {
+		c, err := ParseConfig([]byte(`{"update":{"auto_time":"` + value + `"}}`))
+		if err != nil || c.Update.AutoTime != value {
+			t.Fatalf("auto_time %q parse failed: cfg=%+v err=%v", value, c, err)
+		}
+	}
+}
+
+// TestPanelPollInterval 面板自动刷新间隔：0 = 缺省、负数 = 关闭自动刷新。
+// normalize **不得**把负数回落成 0（那会把「关闭」变成「5 秒」）。
+func TestPanelPollInterval(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c.Panel.PollIntervalSec != 0 {
+		t.Fatalf("缺省 poll_interval_sec=%d want 0（= 前端缺省 5s）", c.Panel.PollIntervalSec)
+	}
+
+	off, err := ParseConfig([]byte(`{"panel":{"poll_interval_sec":-1}}`))
+	if err != nil {
+		t.Fatalf("parse off: %v", err)
+	}
+	if off.Panel.PollIntervalSec != -1 {
+		t.Fatalf("poll_interval_sec=%d want -1（关闭自动刷新，normalize 不得回落）", off.Panel.PollIntervalSec)
+	}
+
+	slow, err := ParseConfig([]byte(`{"panel":{"poll_interval_sec":60}}`))
+	if err != nil {
+		t.Fatalf("parse slow: %v", err)
+	}
+	if slow.Panel.PollIntervalSec != 60 {
+		t.Fatalf("poll_interval_sec=%d want 60", slow.Panel.PollIntervalSec)
+	}
+}
+
+func TestPanelPackageDetailLimit(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c.Panel.PackageDetailLimit != 5 {
+		t.Fatalf("default package_detail_limit=%d want 5", c.Panel.PackageDetailLimit)
+	}
+
+	configured, err := ParseConfig([]byte(`{"panel":{"package_detail_limit":8}}`))
+	if err != nil {
+		t.Fatalf("parse configured limit: %v", err)
+	}
+	if configured.Panel.PackageDetailLimit != 8 {
+		t.Fatalf("configured package_detail_limit=%d want 8", configured.Panel.PackageDetailLimit)
+	}
+
+	fallback, err := ParseConfig([]byte(`{"panel":{"package_detail_limit":0}}`))
+	if err != nil {
+		t.Fatalf("parse fallback limit: %v", err)
+	}
+	if fallback.Panel.PackageDetailLimit != 5 {
+		t.Fatalf("fallback package_detail_limit=%d want 5", fallback.Panel.PackageDetailLimit)
+	}
+}
+
+func TestLoggingDefaults(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if !c.Logging.RequestArchiveEnabled || c.Logging.RequestRetentionDays != 7 || c.Logging.RequestArchiveMaxMB != 100 {
+		t.Fatalf("logging defaults = %+v", c.Logging)
+	}
+	// 来源记录（IP/UA）缺省开启：键缺席时必须保持 true，只有显式 false 才关闭。
+	if !c.Logging.RequestClientInfo {
+		t.Fatalf("request_client_info default = false, want true: %+v", c.Logging)
+	}
+	configured, err := ParseConfig([]byte(`{"logging":{"request_archive_enabled":false,"request_retention_days":30,"request_archive_max_mb":500}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if configured.Logging.RequestArchiveEnabled || configured.Logging.RequestRetentionDays != 30 || configured.Logging.RequestArchiveMaxMB != 500 {
+		t.Fatalf("configured logging = %+v", configured.Logging)
+	}
+	off, err := ParseConfig([]byte(`{"logging":{"request_client_info":false}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if off.Logging.RequestClientInfo {
+		t.Fatalf("explicit false ignored: %+v", off.Logging)
+	}
+	fallback, err := ParseConfig([]byte(`{"logging":{"request_retention_days":0,"request_archive_max_mb":0}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fallback.Logging.RequestRetentionDays != 7 || fallback.Logging.RequestArchiveMaxMB != 100 {
+		t.Fatalf("logging fallback = %+v", fallback.Logging)
+	}
+}
+
+// 回归：request_archive_max_mb<=0 的回落不能顺手把 panel_log_enabled 的显式 false 改回 true；
+// 面板日志的保留天数/总量各自回落。
+func TestPanelLogSettingsIndependentOfRequestArchive(t *testing.T) {
+	c, err := ParseConfig([]byte(`{"logging":{"request_archive_max_mb":0,"panel_log_enabled":false,"panel_log_retention_days":3,"panel_log_max_mb":20}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Logging.PanelLogEnabled || c.Logging.PanelLogRetentionDays != 3 || c.Logging.PanelLogMaxMB != 20 {
+		t.Fatalf("panel log 设置被请求归档的回落改写: %+v", c.Logging)
+	}
+	fallback, err := ParseConfig([]byte(`{"logging":{"panel_log_retention_days":0,"panel_log_max_mb":0}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fallback.Logging.PanelLogEnabled || fallback.Logging.PanelLogRetentionDays != 7 || fallback.Logging.PanelLogMaxMB != 50 {
+		t.Fatalf("panel log 回落: %+v", fallback.Logging)
 	}
 }
 
@@ -90,6 +220,9 @@ func TestNewPoolConfigDefaults(t *testing.T) {
 	if c.Pool.IdleWeightPerHour != 0.5 || c.Pool.IdleWeightMax != 5.0 {
 		t.Errorf("idle weights=%v/%v", c.Pool.IdleWeightPerHour, c.Pool.IdleWeightMax)
 	}
+	if !c.Pool.PreferExpiring || c.ExpiringSoonDur != 30*24*time.Hour {
+		t.Errorf("expiring defaults: enabled=%v window=%v", c.Pool.PreferExpiring, c.ExpiringSoonDur)
+	}
 	if c.SoftRateMaxDur.Hours() != 2 {
 		t.Errorf("soft_rate_max=%v want 2h", c.SoftRateMaxDur)
 	}
@@ -115,7 +248,9 @@ func TestPoolConfigParsedFromFile(t *testing.T) {
 			"breaker_cooldown":"10m",
 			"breaker_cooldown_max":"2h",
 			"idle_weight_per_hour":0.7,
-			"idle_weight_max":8.0
+			"idle_weight_max":8.0,
+			"prefer_expiring":false,
+			"expiring_soon":"72h"
 		},
 		"session_sticky":{"enabled":false,"ttl":"1h","gc_interval":"2m"}
 	}`), 0o600)
@@ -134,6 +269,9 @@ func TestPoolConfigParsedFromFile(t *testing.T) {
 	}
 	if c.Pool.IdleWeightPerHour != 0.7 || c.Pool.IdleWeightMax != 8.0 {
 		t.Errorf("idle weights=%v/%v", c.Pool.IdleWeightPerHour, c.Pool.IdleWeightMax)
+	}
+	if c.Pool.PreferExpiring || c.ExpiringSoonDur != 72*time.Hour {
+		t.Errorf("expiring override: enabled=%v window=%v", c.Pool.PreferExpiring, c.ExpiringSoonDur)
 	}
 	if c.SessionSticky.Enabled {
 		t.Error("session_sticky.enabled want false from file")
@@ -156,6 +294,32 @@ func TestSoftRateMaxParsedFromFile(t *testing.T) {
 	}
 	if c.SoftRateMaxDur.Minutes() != 45 {
 		t.Errorf("soft_rate_max=%v want 45m", c.SoftRateMaxDur)
+	}
+}
+
+func TestLegacyConfigKeepsPreferExpiringEnabled(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"pool":{"idle_weight_max":3}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.Pool.PreferExpiring {
+		t.Fatal("missing prefer_expiring must preserve default true")
+	}
+}
+
+func TestNegativeExpiringSoonClampsToDisabled(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"pool":{"expiring_soon":"-1h"}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.ExpiringSoonDur != 0 || c.Pool.ExpiringSoon != "0" {
+		t.Fatalf("negative window=%v/%q want 0/0", c.ExpiringSoonDur, c.Pool.ExpiringSoon)
 	}
 }
 
@@ -516,7 +680,7 @@ func TestWriteDefault(t *testing.T) {
 	if c.APIKey != key {
 		t.Errorf("api_key=%q want %q", c.APIKey, key)
 	}
-	if c.Listen != ":7863" || c.AuthDir != "./auths" || c.StateFile != "./data/state.json" {
+	if c.Listen != "127.0.0.1:7863" || c.AuthDir != "./auths" || c.StateFile != "./data/state.json" {
 		t.Errorf("generated defaults off: %+v", c)
 	}
 	if len(c.Schedule.CheckinHours) == 0 || !c.Schedule.CheckinEnabled {
@@ -525,6 +689,89 @@ func TestWriteDefault(t *testing.T) {
 	// 已存在的文件不覆盖：二次写入同一路径必须报错
 	if _, err := WriteDefault(fp); err == nil {
 		t.Error("WriteDefault must refuse to overwrite existing file")
+	}
+}
+
+// 补领清扫（issue #174）：缺省启用 + 15 分钟；显式关闭时 interval 归零（不启动）；
+// minutes<=0 回落 15。
+func TestTaskSweepDefaults(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if !c.Schedule.TaskSweepEnabled || c.TaskSweepInterval != 15*time.Minute {
+		t.Errorf("default task sweep: enabled=%v interval=%v", c.Schedule.TaskSweepEnabled, c.TaskSweepInterval)
+	}
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"schedule":{"task_sweep_minutes":3}}`), 0o600)
+	c2, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c2.TaskSweepInterval != 3*time.Minute {
+		t.Errorf("interval=%v want 3m", c2.TaskSweepInterval)
+	}
+	os.WriteFile(fp, []byte(`{"schedule":{"task_sweep_enabled":false}}`), 0o600)
+	c3, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c3.TaskSweepInterval != 0 {
+		t.Errorf("disabled interval=%v want 0", c3.TaskSweepInterval)
+	}
+	os.WriteFile(fp, []byte(`{"schedule":{"task_sweep_minutes":-5}}`), 0o600)
+	c4, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c4.TaskSweepInterval != 15*time.Minute {
+		t.Errorf("negative minutes interval=%v want 15m", c4.TaskSweepInterval)
+	}
+}
+
+// TestKeepaliveRefreshWindow checks defaults, explicit durations, and invalid values.
+func TestKeepaliveRefreshWindow(t *testing.T) {
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if c.Schedule.KeepaliveRefreshWindow != "168h" || c.KeepaliveRefreshWindowDur != 168*time.Hour {
+		t.Fatalf("default keepalive window=%q/%v want 168h", c.Schedule.KeepaliveRefreshWindow, c.KeepaliveRefreshWindowDur)
+	}
+
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	if err := os.WriteFile(fp, []byte(`{"schedule":{"keepalive_refresh_window":"24h"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c2, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c2.KeepaliveRefreshWindowDur != 24*time.Hour {
+		t.Fatalf("explicit keepalive window=%v want 24h", c2.KeepaliveRefreshWindowDur)
+	}
+
+	// 老 config 没这个键：缺键必须回落到默认，不能报错。
+	if err := os.WriteFile(fp, []byte(`{"schedule":{"keepalive_hours":[22]}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c3, err := Load(fp)
+	if err != nil {
+		t.Fatalf("缺键不应报错: %v", err)
+	}
+	if c3.KeepaliveRefreshWindowDur != 168*time.Hour {
+		t.Errorf("缺键窗口=%v want 168h", c3.KeepaliveRefreshWindowDur)
+	}
+
+	for _, raw := range []string{"0s", "-1h", "not-a-duration"} {
+		if err := os.WriteFile(fp, []byte(`{"schedule":{"keepalive_refresh_window":"`+raw+`"}}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(fp); err == nil {
+			t.Errorf("keepalive_refresh_window=%q should be rejected", raw)
+		}
 	}
 }
 
@@ -717,5 +964,246 @@ func TestLoadConfigPathIsDirectory(t *testing.T) {
 	}
 	if !strings.Contains(msg, "config.example.json") {
 		t.Errorf("error should suggest the fix (cp config.example.json): %v", err)
+	}
+}
+
+// TestReserveCreditsDefaultAndOff 保留积分默认值语义：
+// 键缺席 → 10（默认留一线）；显式 0 → 关闭；显式值 → 原样。
+func TestReserveCreditsDefaultAndOff(t *testing.T) {
+	dir := t.TempDir()
+	load := func(t *testing.T, body string) *int64 {
+		t.Helper()
+		fp := filepath.Join(dir, strings.ReplaceAll(t.Name(), "/", "_")+".json")
+		if err := os.WriteFile(fp, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		c, err := Load(fp)
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+		return c.Pool.ReserveCredits
+	}
+	if v := load(t, `{}`); v == nil || *v != 10 {
+		t.Errorf("键缺席 reserve_credits=%v want 10（默认）", v)
+	}
+	if v := load(t, `{"pool":{"reserve_credits":0}}`); v == nil || *v != 0 {
+		t.Errorf("显式 0 reserve_credits=%v want 0（关闭）", v)
+	}
+	if v := load(t, `{"pool":{"reserve_credits":5000}}`); v == nil || *v != 5000 {
+		t.Errorf("显式值 reserve_credits=%v want 5000", v)
+	}
+	if v := load(t, `{"pool":{"reserve_credits":-5}}`); v == nil || *v != 0 {
+		t.Errorf("负值 reserve_credits=%v want 0（归零）", v)
+	}
+}
+
+// TestServerReadTimeout 入站读取上限（issue #100）：空值回落默认 300s；
+// "0" = 显式不限制（0 是合法值不回落）；负值 fail fast（静默钳 0 会把保护悄悄关掉）。
+func TestServerReadTimeout(t *testing.T) {
+	c := Default()
+	if c.Server.ReadTimeout != "300s" {
+		t.Errorf("default read_timeout=%q want 300s", c.Server.ReadTimeout)
+	}
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c.ServerReadTimeoutDur != 300*time.Second {
+		t.Errorf("default dur=%v want 300s", c.ServerReadTimeoutDur)
+	}
+
+	c = Default()
+	c.Server.ReadTimeout = "" // 显式清空 = 未配置 → 回落默认
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize empty: %v", err)
+	}
+	if c.ServerReadTimeoutDur != 300*time.Second {
+		t.Errorf("empty dur=%v want 300s", c.ServerReadTimeoutDur)
+	}
+
+	c = Default()
+	c.Server.ReadTimeout = "0" // 显式 0 = 不限制（http.Server ReadTimeout 0 即无超时）
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize zero: %v", err)
+	}
+	if c.ServerReadTimeoutDur != 0 {
+		t.Errorf("zero dur=%v want 0", c.ServerReadTimeoutDur)
+	}
+
+	c = Default()
+	c.Server.ReadTimeout = "-5s"
+	if err := c.normalize(); err == nil {
+		t.Error("negative read_timeout should fail fast")
+	}
+
+	c = Default()
+	c.Server.ReadTimeout = "bogus"
+	if err := c.normalize(); err == nil {
+		t.Error("unparsable read_timeout should fail fast")
+	}
+}
+
+// TestDNSServersConfigAndEnv dns_servers 两种来源：配置文件数组原样保留；
+// WB2A_DNS 逗号分隔覆盖（去空白、丢空项）。空 = 系统解析器，不得塞空串进去。
+func TestDNSServersConfigAndEnv(t *testing.T) {
+	c, err := ParseConfig([]byte(`{"dns_servers":["223.5.5.5","1.1.1.1:5353"]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(c.DNSServers, ","); got != "223.5.5.5,1.1.1.1:5353" {
+		t.Fatalf("文件配置 dns_servers=%v", c.DNSServers)
+	}
+
+	t.Setenv("WB2A_DNS", " 119.29.29.29 , ,8.8.8.8")
+	c2, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(c2.DNSServers, ","); got != "119.29.29.29,8.8.8.8" {
+		t.Fatalf("WB2A_DNS 覆盖结果=%v", c2.DNSServers)
+	}
+
+	// 面板/环境变量管理的字段清单要认它，否则面板会让人以为改了配置能生效。
+	managed := c2.EnvironmentManagedFields()
+	found := false
+	for _, f := range managed {
+		if f == "dns_servers" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("dns_servers 应出现在环境变量管理字段里：%v", managed)
+	}
+
+	c3, err := ParseConfig([]byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c3.DNSServers) != 0 {
+		t.Fatalf("缺省应为空（系统解析器）：%v", c3.DNSServers)
+	}
+}
+
+func TestPeriodicJitterPermillConfig(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"listen":":9999","api_key":"k","schedule":{"balance_refresh_jitter_permill":200,"task_sweep_jitter_permill":300}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Schedule.BalanceRefreshJitterPermill != 200 || c.Schedule.TaskSweepJitterPermill != 300 {
+		t.Fatalf("c.Schedule=%+v", c.Schedule)
+	}
+
+	// 超上限拒绝（上限 500 = 50%）。
+	os.WriteFile(fp, []byte(`{"listen":":9999","api_key":"k","schedule":{"balance_refresh_jitter_permill":501}}`), 0o600)
+	if _, err := Load(fp); err == nil {
+		t.Fatal("want error for jitter_permill > 500")
+	}
+
+	// 负数拒绝。
+	os.WriteFile(fp, []byte(`{"listen":":9999","api_key":"k","schedule":{"task_sweep_jitter_permill":-1}}`), 0o600)
+	if _, err := Load(fp); err == nil {
+		t.Fatal("want error for negative jitter_permill")
+	}
+
+	// env 覆盖。
+	t.Setenv("WB2A_SCHEDULE_BALANCE_REFRESH_JITTER_PERMILL", "250")
+	t.Setenv("WB2A_SCHEDULE_TASK_SWEEP_JITTER_PERMILL", "100")
+	c2, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c2.Schedule.BalanceRefreshJitterPermill != 250 || c2.Schedule.TaskSweepJitterPermill != 100 {
+		t.Fatalf("env override: %+v", c2.Schedule)
+	}
+}
+
+func TestThinkingDefaults(t *testing.T) {
+	c := Default()
+	if !c.Thinking.Enabled {
+		t.Error("thinking.enabled default should be true")
+	}
+	// 缺省 high（upstream.DefaultGatewayEffort），不是 max：思考与正文共用一份输出
+	// 额度，max 会把预算烧在思考上、正文只剩半句。
+	if c.Thinking.DefaultEffort != upstream.DefaultGatewayEffort {
+		t.Errorf("thinking.default_effort=%q want %q", c.Thinking.DefaultEffort, upstream.DefaultGatewayEffort)
+	}
+	if !c.Thinking.ClientPriority {
+		t.Error("thinking.client_priority default should be true")
+	}
+	if c.Thinking.OverrideScope != "level" {
+		t.Errorf("thinking.override_scope=%q want level", c.Thinking.OverrideScope)
+	}
+}
+
+func TestThinkingRejectsInvalid(t *testing.T) {
+	for _, raw := range []string{
+		`{"thinking":{"default_effort":"turbo"}}`,
+		`{"thinking":{"default_effort":"off"}}`,
+		`{"thinking":{"override_scope":"everything"}}`,
+		`{"thinking":{"model_defaults":{"glm-5.2":"ultra"}}}`,
+	} {
+		if _, err := ParseConfig([]byte(raw)); err == nil {
+			t.Fatalf("%s should be rejected", raw)
+		}
+	}
+}
+
+func TestThinkingNormalize(t *testing.T) {
+	c, err := ParseConfig([]byte(`{"thinking":{"default_effort":" HIGH ","override_scope":"ALL",` +
+		`"model_defaults":{" glm-5.2 ":"Max","legacy":"inherit","":"high","blank":" ","glm-5.3":"Off"}}}`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if c.Thinking.DefaultEffort != "high" {
+		t.Errorf("default_effort=%q want high", c.Thinking.DefaultEffort)
+	}
+	if c.Thinking.OverrideScope != "all" {
+		t.Errorf("override_scope=%q want all", c.Thinking.OverrideScope)
+	}
+	if got := c.Thinking.ModelDefaults; len(got) != 2 || got["glm-5.2"] != "max" || got["glm-5.3"] != "off" {
+		t.Fatalf("model_defaults=%v（inherit/空键/空值应被剔除，off 是合法的按模型关闭）", got)
+	}
+}
+
+func TestThinkingEnvOverride(t *testing.T) {
+	t.Setenv("WB2A_THINKING_ENABLED", "false")
+	t.Setenv("WB2A_THINKING_DEFAULT_EFFORT", "xhigh")
+	t.Setenv("WB2A_THINKING_CLIENT_PRIORITY", "false")
+	t.Setenv("WB2A_THINKING_OVERRIDE_SCOPE", "all")
+	c := Default()
+	applyEnv(c)
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c.Thinking.Enabled || c.Thinking.ClientPriority {
+		t.Fatalf("bool env override failed: %+v", c.Thinking)
+	}
+	if c.Thinking.DefaultEffort != "xhigh" || c.Thinking.OverrideScope != "all" {
+		t.Fatalf("string env override failed: %+v", c.Thinking)
+	}
+	if fields := c.EnvironmentManagedFields(); len(fields) == 0 {
+		t.Error("thinking env vars should be reported as managed")
+	}
+}
+
+func TestConfigExampleParses(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "config.example.json"))
+	if err != nil {
+		t.Fatalf("read example: %v", err)
+	}
+	var cfg Config
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("parse example: %v", err)
+	}
+	if err := cfg.normalizeThinking(); err != nil {
+		t.Fatalf("normalize example thinking: %v", err)
+	}
+	// default_effort 期望 high 而不是 max：思考与正文共用一份输出额度，max 会把预算
+	// 烧在思考上、正文只剩半句（实测 max 正文 1906 token vs high 3236 token）。
+	// 与 hub 的 WB_DEFAULT_REASONING_EFFORT 默认值同口径（issue #508）。
+	if !cfg.Thinking.Enabled || !cfg.Thinking.ClientPriority || cfg.Thinking.OverrideScope != "level" || cfg.Thinking.DefaultEffort != "high" {
+		t.Fatalf("unexpected example thinking defaults: %+v", cfg.Thinking)
 	}
 }
