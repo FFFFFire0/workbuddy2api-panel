@@ -1,15 +1,16 @@
 services:
   wb2api:
-    # 默认使用上游预编译镜像：docker compose pull && docker compose up -d --no-build。
-    # latest 跟随 main；固定版本可用 :2026.11.1.905（镜像标签不带 v）。
-    image: ghcr.io/misakano7545/workbuddy2api-panel:latest
-    # 源码构建：注释 image，取消下面 build 段的注释，
-    # 再 git pull && docker compose up -d --build；两种方式二选一。
-    # build:
-    #   context: .
-    #   args:
-    #     APP_VERSION: ${APP_VERSION:-dev}
-    # 自建版本默认 dev；如需版本比较，在 .env 设置 APP_VERSION（例如 2026.11.3.820）。
+    # 默认从源码构建，确保跑的是本 fork 的代码（而不是别人的预编译镜像）。
+    # docker compose up -d --build
+    build:
+      context: .
+      args:
+        APP_VERSION: ${APP_VERSION:-dev}
+    # 若想改用 GHCR 预编译镜像：注释掉上面的 build 段，取消下面 image 行的注释。
+    # 镜像由本仓 .github/workflows/docker-ghcr.yml 推送到 ghcr.io/<你的仓库>；
+    # latest 跟随 main，时间标签形如 :2026.11.23.1922（不带 v）。
+    # image: ghcr.io/fffffire0/workbuddy2api-panel:latest
+    # 自建版本默认 dev；如需版本比较，在 .env 设置 APP_VERSION（例如 2026.11.23.1922）。
     container_name: workbuddy2api
     restart: unless-stopped
     # 容器默认以 app 用户（uid 10001）运行。宿主机挂载目录属主不同会导致
